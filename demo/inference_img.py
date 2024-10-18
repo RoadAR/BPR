@@ -1,3 +1,4 @@
+import argparse
 import os 
 import os.path as osp
 import torch 
@@ -11,7 +12,7 @@ from tqdm import tqdm
 from functools import partial
 from torch.utils.data import Dataset, DataLoader
 
-from mmcv.runner import load_checkpoint
+from mmengine.runner import load_checkpoint
 from mmseg.models import build_segmentor
 from mmcv.parallel import MMDataParallel, DataContainer, collate
 
@@ -84,42 +85,42 @@ def get_dets(fbmask, patch_size, iou_thresh=0.3):
 
 
 class PatchDataset(Dataset):
-    def __init__(self, img_paths, dt_paths, device, out_size=(128,128)):
+    def __init__(self, imgs_cap, masks_cap, target_class, device, out_size=(128,128)):
         self.device = device
         self.out_size = out_size
         self.img_mean = np.array([123.675, 116.28, 103.53]).reshape(1,1,3)
         self.img_std = np.array([58.395, 57.12, 57.375]).reshape(1,1,3)
-        self._img2dts = list(zip(img_paths, dt_paths))      # list of (img_path, list of coarse_mask_path)
+        self.imgs_cap = imgs_cap
+        self.masks_cap = masks_cap
+        self.target_class = target_class
 
     def __len__(self):
-        return len(self._img2dts)
+        return int(min(self.imgs_cap.get(cv2.CAP_PROP_FRAME_COUNT), self.masks_cap.get(cv2.CAP_PROP_FRAME_COUNT)))
 
     def __getitem__(self, i):
-        img_path, dt_paths = self._img2dts[i]
-        img = cv2.imread(img_path)[:,:,::-1]     # BGR -> RGB
+        ret_img, img = self.imgs_cap.read()
+        ret_mask, mask = self.masks_cap.read()
+        if not ret_img or not ret_mask:
+            return None
+        img = img[:,:,::-1]     # BGR -> RGB
         img = np.ascontiguousarray(img)
         img = (img - self.img_mean) / self.img_std
 
-        valid_dt_paths, valid_maskdt = [], []   # skip empty mask
-        for dt_path in dt_paths:
-            m = cv2.imread(dt_path, 0) > 0
-            if m.any():
-                valid_dt_paths.append(dt_path)
-                valid_maskdt.append(m)
-        if len(valid_dt_paths):
-            valid_maskdt = np.stack(valid_maskdt)
+        if len(mask.shape) > 2:
+            mask = mask[:,:,2] # Red channel (for LSA segmentation)
+        if self.target_class is None:
+            mask = mask > 0
         else:
-            valid_maskdt = np.zeros((0, 1024, 2048), dtype=np.float32)
+            mask = mask == self.target_class
 
         return DataContainer([
-                valid_dt_paths,
                 torch.tensor(img, dtype=torch.float), \
-                torch.tensor(valid_maskdt, dtype=torch.float)
+                torch.tensor(mask, dtype=torch.float)
             ])
 
 
-def _build_dataloader(img_paths, dt_paths, device):
-    dataset = PatchDataset(img_paths, dt_paths, device)
+def _build_dataloader(imgs_cap, masks_cap, target_class, device):
+    dataset = PatchDataset(imgs_cap, masks_cap, target_class, device)
     return DataLoader(dataset, pin_memory=True, collate_fn=collate)
 
 
@@ -206,44 +207,60 @@ def merge(maskdts, detss, maskss, patch_size=64):
     return out
 
 
-def inference(cfg, ckpt, img_paths, dt_paths, out_dir, max_ins=32):
-    if not osp.exists(out_dir):
-        os.makedirs(out_dir)
-
+def inference(cfg, ckpt, video_path, masks_video_path, out_video_path, target_class = None):
     model = _build_model(cfg, ckpt)
-    dataloader = _build_dataloader(img_paths, dt_paths, 
-            device=torch.device('cuda:0'))
+    imgs_cap = cv2.VideoCapture(video_path)
+    masks_cap = cv2.VideoCapture(masks_video_path)
+    assert imgs_cap.isOpened()
+    assert masks_cap.isOpened()
+    dataloader = _build_dataloader(imgs_cap, masks_cap, target_class, device=torch.device('cuda:0'))
+    width  = int(masks_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(masks_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = masks_cap.get(cv2.CAP_PROP_FPS)
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out_writer = cv2.VideoWriter(out_video_path, fourcc, fps, (width, height))
 
-    def _inference_one(img, sub_maskdts, sub_dt_paths): # to save GPU memory
-        dets, patches = split(img, sub_maskdts)
-        masks = model(patches)[:,1,:,:]         # N, 128, 128
-        refineds = merge(sub_maskdts, dets, masks)
-        for i, dt_path in enumerate(sub_dt_paths):
-            cv2.imwrite(
-                osp.join(out_dir, osp.basename(dt_path)),
-                refineds[i].cpu().numpy().astype(np.uint8) * 255
-            )
-        return refineds[i].cpu().numpy().astype(np.uint8) * 255
+    def _inference_one(img, maskdts, curr_mask, target_class, out_writer): # to save GPU memory
+        if maskdts is not None:
+            dets, patches = split(img, maskdts.unsqueeze(0))
+            masks = model(patches)[:,1,:,:]         # N, 128, 128
+            refined = merge(maskdts.unsqueeze(0), dets, masks)[0]
+            refined = torch.max(curr_mask, refined)
+        else:
+            refined = curr_mask
 
+        refined = refined.cpu().numpy().astype(np.uint8)
+        kernel = np.ones((11, 11), dtype=np.uint8)
+        out_mask = np.zeros((height, width, 3), dtype=np.uint8)
+        out_mask[:,:,2] = cv2.dilate(refined * target_class, kernel) # out like LSA segmentation
+        out_writer.write(out_mask)
+        refined = cv2.erode(refined, kernel)
+        return torch.tensor(refined, dtype=torch.float, device='cuda')
+
+    if target_class is None:
+        target_class = 255
     # inference on each image
     with tqdm(dataloader) as tloader:
+        maskdts = None
         for dc in tloader:
-            dt_paths, img, maskdts = dc.data[0][0]
-            if len(dt_paths):
-                img = img.cuda()             # 3, 1024, 2048
-                maskdts = maskdts.cuda()     # N, 1024, 2048
+            if dc is None:
+                break
+            img, curr_mask = dc.data[0][0]
+            img = img.cuda()             # 3, H, W
+            curr_mask = curr_mask.cuda()     # H, W
 
-                p = 0
-                for sub_maskdts in maskdts.split(max_ins):
-                    q = p + sub_maskdts.size(0)
-                    sub_dt_paths = dt_paths[p:q]
-                    p = q
-                    _inference_one(img, sub_maskdts, sub_dt_paths)
+            maskdts = _inference_one(img, maskdts, curr_mask, target_class, out_writer)
 
 
 if __name__=='__main__':
-    cfg = "../configs/bpr/hrnet18s_128.py"
-    ckpt = "../ckpts/hrnet18s_128-24055c80.pth"
-    img_paths = ['lindau_000000_000019_leftImg8bit.png', ]            # image
-    dt_paths = [['lindau_000000_000019_leftImg8bit_15_car.png'], ]    # coarse mask images: 0 for background, >0 for instance
-    inference(cfg, ckpt, img_paths, dt_paths, "./refined", max_ins=32)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--cfg', required=False, default='../configs/bpr/hrnet48_256.py', help='path to the config')
+    parser.add_argument('--ckpt', required=True, help='path to the checkpoint')
+    parser.add_argument('--video', required=True, help='path to the rgb video')
+    parser.add_argument('--masks_video', required=True, help='path to the video with masks')
+    parser.add_argument('--out_video', required=True, help='path to the output video with masks')
+    parser.add_argument('--target_class', required=False, default=None, help='mark of the target semantic class')
+
+    args = parser.parse_args()
+
+    inference(args.cfg, args.ckpt, args.video, args.masks_video, args.out_video, args.target_class)
