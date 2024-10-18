@@ -259,7 +259,7 @@ if __name__=='__main__':
     parser.add_argument('--video', required=True, help='path to the rgb video')
     parser.add_argument('--masks_video', required=True, help='path to the video with masks')
     parser.add_argument('--out_video', required=True, help='path to the output video with masks')
-    parser.add_argument('--target_class', required=False, default=None, help='mark of the target semantic class')
+    parser.add_argument('--target_class', required=False, default=None, type=int, help='mark of the target semantic class')
 
     args = parser.parse_args()
 
